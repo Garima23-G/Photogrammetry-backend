@@ -101,8 +101,12 @@ def measure_handhole(pcd):
     if pcd is None or pcd.is_empty():
         return {"L_m": 0.0, "W_m": 0.0, "H_m": 0.0}
 
+    # Pre-process: remove outliers for robust OBB
+    pcd_filtered, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
     # OBB finds minimal enclosing box at any angle
-    obb = pcd.get_oriented_bounding_box()
+    # Using get_minimal_oriented_bounding_box for higher accuracy
+    obb = pcd_filtered.get_minimal_oriented_bounding_box()
     # Extent sorted: longest -> shortest
     extent = sorted(obb.extent, reverse=True)
 
