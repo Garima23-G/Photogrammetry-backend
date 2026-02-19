@@ -1,7 +1,6 @@
 import numpy as np
 import open3d as o3d
 from measurement.utils import fit_circle_ransac, estimate_axis_pca
-from measurement.categories import normalize_category_name
 
 def measure_trench(points):
     """
@@ -117,25 +116,6 @@ def measure_handhole(pcd):
         "H_m": float(extent[2])
     }
 
-MEASUREMENT_HANDLERS = {
-    "trench": lambda pcd, points: measure_trench(points),
-    "manhole": lambda pcd, points: measure_manhole(points),
-    "duct": lambda pcd, points: measure_duct(points),
-    "handhole": lambda pcd, points: measure_handhole(pcd),
-}
-
-
-def register_measurement_handler(category, handler_fn):
-    """
-    Register a new category handler.
-    handler_fn signature: fn(pcd, points) -> dict
-    """
-    cat = normalize_category_name(category)
-    if not cat:
-        raise ValueError("Category cannot be empty.")
-    MEASUREMENT_HANDLERS[cat] = handler_fn
-
-
 def measure_asset(pcd, category_tag):
     """
     Main router for Stage 05 Measurement Engine.
@@ -164,10 +144,18 @@ def measure_asset(pcd, category_tag):
         "point_count": int(point_count)
     }
 
-    cat = normalize_category_name(category_tag)
-    handler = MEASUREMENT_HANDLERS.get(cat)
-    if handler is not None:
-        m = handler(pcd, points)
+    cat = category_tag.lower()
+    if cat == "trench":
+        m = measure_trench(points)
+        res.update(m)
+    elif cat == "manhole":
+        m = measure_manhole(points)
+        res.update(m)
+    elif cat == "duct":
+        m = measure_duct(points)
+        res.update(m)
+    elif cat == "handhole":
+        m = measure_handhole(pcd)
         res.update(m)
 
     return res
