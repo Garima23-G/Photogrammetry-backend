@@ -3,3 +3,4 @@ numpy
 pytest
 flask
 opencv-python
+cV2
