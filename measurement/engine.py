@@ -2,6 +2,7 @@ import numpy as np
 import open3d as o3d
 from measurement.utils import fit_circle_ransac, estimate_axis_pca
 from measurement.categories import normalize_category_name
+from measurement.segmentation import segment_asset_roi, roi_matches_category
 
 def measure_trench(points):
     """
@@ -147,7 +148,9 @@ def measure_asset(pcd, category_tag):
     Returns:
         Structured dictionary following Stage 05 JSON response schema.
     """
-    points = np.asarray(pcd.points)
+    cat = normalize_category_name(category_tag)
+    roi_pcd = segment_asset_roi(pcd, cat)
+    points = np.asarray(roi_pcd.points)
     point_count = len(points)
 
     # Initialize default response structure
@@ -161,13 +164,21 @@ def measure_asset(pcd, category_tag):
         "W_m": None,
         "H_m": None,
         "confidence": "high" if point_count > 50000 else "medium" if point_count > 5000 else "low",
-        "point_count": int(point_count)
+        "point_count": int(point_count),
+        "detected": True,
     }
 
-    cat = normalize_category_name(category_tag)
     handler = MEASUREMENT_HANDLERS.get(cat)
     if handler is not None:
-        m = handler(pcd, points)
+        matched, score, _ = roi_matches_category(roi_pcd, cat)
+        res["roi_match_score"] = float(score)
+        if not matched:
+            res["detected"] = False
+            res["confidence"] = "low"
+            res["message"] = f"{cat} not detected"
+            return res
+
+        m = handler(roi_pcd, points)
         res.update(m)
 
     return res

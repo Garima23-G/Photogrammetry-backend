@@ -7,6 +7,7 @@ from measurement.engine import measure_asset
 from measurement.classifier import (
     detect_asset_category_hybrid,
     detect_asset_category_from_images,
+    detect_asset_region_from_images,
 )
 from measurement.categories import normalize_category_name
 
@@ -26,6 +27,7 @@ def index():
                 "POST /classify": "Classify asset (RGB-only or hybrid RGBD).",
                 "POST /reconstruct": "Run Stage-04 reconstruction only.",
                 "POST /process": "Run end-to-end reconstruction + classification + measurement.",
+                "POST /pose_sanity": "Validate intrinsics/poses metadata before reconstruction.",
             },
         }
     )
@@ -75,6 +77,104 @@ def _parse_intrinsics_and_poses():
     intrinsic_matrix = np.array(json.loads(intrinsics_json), dtype=np.float64)
     poses = [np.array(p, dtype=np.float64) for p in json.loads(poses_json)]
     return intrinsic_matrix, poses
+
+
+def _analyze_intrinsics_and_poses(intrinsic_matrix, poses):
+    issues = []
+    warnings = []
+
+    if intrinsic_matrix.shape != (3, 3):
+        issues.append("Intrinsics must be a 3x3 matrix.")
+    elif not np.all(np.isfinite(intrinsic_matrix)):
+        issues.append("Intrinsics contain non-finite values.")
+    else:
+        fx = float(intrinsic_matrix[0, 0])
+        fy = float(intrinsic_matrix[1, 1])
+        if fx <= 0 or fy <= 0:
+            issues.append("Intrinsics focal lengths (fx, fy) must be positive.")
+
+    if not poses:
+        issues.append("At least one pose is required.")
+
+    translation_vectors = []
+    nonzero_last_row_xyz = 0
+    near_zero_translation_column = 0
+    invalid_pose_count = 0
+
+    for idx, pose in enumerate(poses):
+        if pose.shape != (4, 4):
+            issues.append(f"Pose {idx} is not 4x4.")
+            invalid_pose_count += 1
+            continue
+        if not np.all(np.isfinite(pose)):
+            issues.append(f"Pose {idx} contains non-finite values.")
+            invalid_pose_count += 1
+            continue
+
+        translation = pose[:3, 3]
+        translation_vectors.append(translation)
+        if np.linalg.norm(translation) < 1e-4:
+            near_zero_translation_column += 1
+
+        last_row_xyz_norm = float(np.linalg.norm(pose[3, :3]))
+        if last_row_xyz_norm > 1e-4:
+            nonzero_last_row_xyz += 1
+
+        last_row_err = float(np.max(np.abs(pose[3] - np.array([0.0, 0.0, 0.0, 1.0]))))
+        if last_row_err > 1e-2:
+            warnings.append(
+                f"Pose {idx} has unusual last row; expected close to [0, 0, 0, 1]."
+            )
+
+        rotation = pose[:3, :3]
+        ortho_err = float(np.linalg.norm(rotation.T @ rotation - np.eye(3), ord="fro"))
+        det = float(np.linalg.det(rotation))
+        if ortho_err > 0.1 or abs(det) < 0.5 or abs(det) > 1.5:
+            issues.append(
+                f"Pose {idx} rotation block is not a valid rotation (det={det:.4f}, ortho_err={ortho_err:.4f})."
+            )
+        elif ortho_err > 0.01 or abs(det - 1.0) > 0.05:
+            warnings.append(
+                f"Pose {idx} rotation block is noisy (det={det:.4f}, ortho_err={ortho_err:.4f})."
+            )
+
+    pose_count = len(poses)
+    step_count = 0
+    median_step_m = 0.0
+    max_step_m = 0.0
+    if len(translation_vectors) >= 2:
+        translation_np = np.asarray(translation_vectors, dtype=np.float64)
+        steps = np.linalg.norm(np.diff(translation_np, axis=0), axis=1)
+        step_count = int(len(steps))
+        median_step_m = float(np.median(steps))
+        max_step_m = float(np.max(steps))
+        if median_step_m < 1e-5:
+            warnings.append("Pose sequence has near-zero camera motion.")
+        if max_step_m > 5.0:
+            warnings.append("Pose sequence has very large frame-to-frame motion (>5m).")
+
+    if pose_count > 0:
+        likely_transposed = (
+            nonzero_last_row_xyz >= max(1, pose_count // 2)
+            and near_zero_translation_column >= max(1, pose_count // 2)
+        )
+        if likely_transposed:
+            issues.append(
+                "Poses look transposed/column-major in JSON (translation appears in last row, not last column)."
+            )
+
+    return {
+        "ok": len(issues) == 0,
+        "issues": issues,
+        "warnings": warnings,
+        "summary": {
+            "pose_count": pose_count,
+            "invalid_pose_count": invalid_pose_count,
+            "step_count": step_count,
+            "median_step_m": median_step_m,
+            "max_step_m": max_step_m,
+        },
+    }
 
 
 def _parse_rgbd_frames_from_poses(poses):
@@ -163,6 +263,7 @@ def classify_asset():
             category, confidence, scores, details = detect_asset_category_hybrid(
                 rgb_frames, reconstruction_result["pcd"]
             )
+            detection, detection_preview_b64 = detect_asset_region_from_images(rgb_frames, include_preview=True)
             return jsonify(
                 {
                     "category": category,
@@ -170,18 +271,23 @@ def classify_asset():
                     "category_confidence": confidence,
                     "category_scores": scores,
                     "category_details": details,
+                    "detection": detection,
+                    "detection_preview_jpeg_base64": detection_preview_b64,
                     "reconstruction_summary": _build_reconstruction_summary(reconstruction_result),
                 }
             )
 
         rgb_frames = _parse_rgb_frames_only()
         category, confidence, scores = detect_asset_category_from_images(rgb_frames)
+        detection, detection_preview_b64 = detect_asset_region_from_images(rgb_frames, include_preview=True)
         return jsonify(
             {
                 "category": category,
                 "category_source": "auto_rgb",
                 "category_confidence": confidence,
                 "category_scores": scores,
+                "detection": detection,
+                "detection_preview_jpeg_base64": detection_preview_b64,
             }
         )
     except ValueError as e:
@@ -251,6 +357,22 @@ def process_reconstruction():
         return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/pose_sanity", methods=["POST"])
+def pose_sanity():
+    """
+    Validate capture metadata only (intrinsics + poses), without processing images.
+    """
+    try:
+        intrinsic_matrix, poses = _parse_intrinsics_and_poses()
+        analysis = _analyze_intrinsics_and_poses(intrinsic_matrix, poses)
+        return jsonify(analysis)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)

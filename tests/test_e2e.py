@@ -176,6 +176,7 @@ def test_classify_rgb_only(client):
     assert res_json["category"] in ["trench", "manhole", "duct", "handhole"]
     assert "category_scores" in res_json
     assert "category_confidence" in res_json
+    assert "detection" in res_json
 
 
 def test_classify_hybrid(client):
@@ -187,6 +188,7 @@ def test_classify_hybrid(client):
     assert res_json["category_source"] == "auto_hybrid"
     assert res_json["category"] in ["trench", "manhole", "duct", "handhole"]
     assert "category_details" in res_json
+    assert "detection" in res_json
     assert "reconstruction_summary" in res_json
     assert res_json["reconstruction_summary"]["point_count"] > 0
 
@@ -201,3 +203,53 @@ def test_reconstruct_only_endpoint(client):
     assert "triangle_count" in res_json
     assert "pcd_empty" in res_json
     assert "mesh_empty" in res_json
+
+
+def test_pose_sanity_valid_payload(client):
+    intrinsic_matrix = np.array([
+        [500, 0, 320],
+        [0, 500, 240],
+        [0, 0, 1]
+    ], dtype=np.float64)
+
+    poses = [np.eye(4), np.eye(4)]
+    poses[1][0, 3] = 0.1
+
+    data = {
+        "intrinsics": json.dumps(intrinsic_matrix.tolist()),
+        "poses": json.dumps([p.tolist() for p in poses]),
+    }
+
+    response = client.post("/pose_sanity", data=data, content_type="multipart/form-data")
+    assert response.status_code == 200
+    res_json = response.get_json()
+
+    assert res_json["ok"] is True
+    assert res_json["issues"] == []
+    assert res_json["summary"]["pose_count"] == 2
+
+
+def test_pose_sanity_detects_transposed_pose_layout(client):
+    intrinsic_matrix = np.array([
+        [500, 0, 320],
+        [0, 500, 240],
+        [0, 0, 1]
+    ], dtype=np.float64)
+
+    pose_a = np.eye(4)
+    pose_b = np.eye(4)
+    # Simulate transposed serialization where translation lands in last row.
+    pose_a[3, 0] = 0.1
+    pose_b[3, 0] = 0.2
+
+    data = {
+        "intrinsics": json.dumps(intrinsic_matrix.tolist()),
+        "poses": json.dumps([pose_a.tolist(), pose_b.tolist()]),
+    }
+
+    response = client.post("/pose_sanity", data=data, content_type="multipart/form-data")
+    assert response.status_code == 200
+    res_json = response.get_json()
+
+    assert res_json["ok"] is False
+    assert any("column-major" in issue for issue in res_json["issues"])

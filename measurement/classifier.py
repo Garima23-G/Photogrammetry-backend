@@ -1,3 +1,4 @@
+import base64
 import cv2
 import numpy as np
 from measurement.utils import fit_circle_ransac
@@ -75,6 +76,122 @@ def _frame_features(rgb):
         "rectangularity": rectangularity,
         "aspect_ratio": aspect_ratio,
     }
+
+
+def _extract_primary_contour(rgb):
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    h, w = gray.shape
+    image_area = float(h * w)
+
+    edge = cv2.Canny(blur, 60, 160)
+    edge = cv2.dilate(edge, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    edge = cv2.morphologyEx(edge, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8), iterations=2)
+
+    _, th_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th_otsu = cv2.morphologyEx(th_otsu, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8), iterations=2)
+    th_inv = cv2.bitwise_not(th_otsu)
+
+    candidates = []
+    for mask in (edge, th_otsu, th_inv):
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates.extend(contours)
+
+    best = None
+    best_score = -1.0
+    for cnt in candidates:
+        area = float(cv2.contourArea(cnt))
+        if area < 0.005 * image_area or area > 0.95 * image_area:
+            continue
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        bbox_area = float(max(1, bw * bh))
+        rectangularity = float(np.clip(area / bbox_area, 0.0, 1.0))
+        area_ratio = float(area / image_area)
+        # Prefer substantial, coherent foreground contours.
+        score = 3.2 * area_ratio + 1.2 * rectangularity
+        if score > best_score:
+            best_score = score
+            best = (cnt, x, y, bw, bh, area_ratio, rectangularity, score)
+
+    if best is None:
+        return None
+    return best
+
+
+def detect_asset_region_from_images(rgb_frames, include_preview=True):
+    """
+    Finds a dominant object contour from RGB frames and returns:
+    - detection dictionary (bbox + polygon in pixel and normalized coords)
+    - optional annotated preview image as base64-encoded JPEG.
+    """
+    if not rgb_frames:
+        return None, None
+
+    best = None
+    best_frame_idx = -1
+    for idx, rgb in enumerate(rgb_frames):
+        contour_info = _extract_primary_contour(rgb)
+        if contour_info is None:
+            continue
+        if best is None or contour_info[-1] > best[-1]:
+            best = contour_info
+            best_frame_idx = idx
+
+    if best is None:
+        return None, None
+
+    cnt, x, y, bw, bh, area_ratio, rectangularity, score = best
+    frame = rgb_frames[best_frame_idx]
+    h, w = frame.shape[:2]
+    peri = cv2.arcLength(cnt, True)
+    approx = cv2.approxPolyDP(cnt, 0.01 * peri, True)
+    polygon = [[int(p[0][0]), int(p[0][1])] for p in approx]
+
+    detection = {
+        "frame_index": int(best_frame_idx),
+        "score": float(score),
+        "area_ratio": float(area_ratio),
+        "rectangularity": float(rectangularity),
+        "bbox": {
+            "x": int(x),
+            "y": int(y),
+            "w": int(bw),
+            "h": int(bh),
+        },
+        "bbox_norm": {
+            "x": float(x / max(1.0, w)),
+            "y": float(y / max(1.0, h)),
+            "w": float(bw / max(1.0, w)),
+            "h": float(bh / max(1.0, h)),
+        },
+        "polygon": polygon,
+        "polygon_norm": [
+            [float(px / max(1.0, w)), float(py / max(1.0, h))]
+            for px, py in polygon
+        ],
+        "image_size": {"width": int(w), "height": int(h)},
+    }
+
+    preview_b64 = None
+    if include_preview:
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        cv2.drawContours(bgr, [approx], -1, (50, 220, 50), 3)
+        cv2.rectangle(bgr, (x, y), (x + bw, y + bh), (60, 60, 240), 2)
+        cv2.putText(
+            bgr,
+            f"score={score:.2f}",
+            (x, max(20, y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        if ok:
+            preview_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
+
+    return detection, preview_b64
 
 
 def detect_asset_category_from_images(rgb_frames):
