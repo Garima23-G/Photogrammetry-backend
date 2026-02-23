@@ -76,3 +76,28 @@ To see accuracy reports during testing:
 ```bash
 python3 -m pytest tests/accuracy_validation.py -s
 ```
+
+## Windows Quick Start (Current Folder Name)
+
+If your backend folder is named `Photogrammetry-backend_ios`, use:
+
+```powershell
+cd D:\Downloads_D\Q-GIS\AI_measurements\approach_5_Photogrammetry\Photogrammetry-backend_ios
+D:\venvs\photogrammetry_backend\Scripts\Activate.ps1
+python -m api.app
+```
+
+## Sample API Test Files
+
+Dummy files are included for quick endpoint checks:
+
+- `sample_data/dummy_rgbd/rgb_0.png`
+- `sample_data/dummy_rgbd/rgb_1.png`
+- `sample_data/dummy_rgbd/depth_0.png`
+- `sample_data/dummy_rgbd/depth_1.png`
+
+Run API checks with:
+
+```powershell
+.\run_api_examples.ps1 -Mode all
+```
