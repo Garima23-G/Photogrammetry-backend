@@ -1,5 +1,6 @@
 import numpy as np
 import open3d as o3d
+import cv2
 
 def estimate_bounding_box(depth_frames, intrinsic_matrix, poses, sample_rate=10, step=20):
     """
@@ -65,8 +66,14 @@ def invert_poses(poses):
     """
     return [np.linalg.inv(p) for p in poses]
 
+
+def _uniform_frame_indices(frame_count, max_frames):
+    if frame_count <= max_frames:
+        return list(range(frame_count))
+    return np.linspace(0, frame_count - 1, max_frames, dtype=int).tolist()
+
 def reconstruct_scene(rgb_frames, depth_frames, intrinsic_matrix, poses, category_tag,
-                      voxel_length=0.004, sdf_trunc=0.012):
+                      voxel_length=0.004, sdf_trunc=0.012, max_frames=30, max_image_dim=640):
     """
     Performs RGBD volumetric fusion using ScalableTSDFVolume.
 
@@ -86,6 +93,17 @@ def reconstruct_scene(rgb_frames, depth_frames, intrinsic_matrix, poses, categor
             'mesh': o3d.geometry.TriangleMesh object.
             'category_tag': The input category tag.
     """
+    if not rgb_frames or not depth_frames or not poses:
+        raise ValueError("No frames/poses available for reconstruction.")
+
+    # Keep fusion bounded in memory for mobile uploads:
+    # - uniform frame subsampling when too many frames are sent
+    # - optional image downscale before TSDF integration
+    frame_indices = _uniform_frame_indices(len(rgb_frames), max_frames)
+    rgb_frames = [rgb_frames[i] for i in frame_indices]
+    depth_frames = [depth_frames[i] for i in frame_indices]
+    poses = [poses[i] for i in frame_indices]
+
     # 1. Estimate bounding box (used later for cropping/padding requirements)
     bbox_min, bbox_max = estimate_bounding_box(depth_frames, intrinsic_matrix, poses)
 
@@ -100,7 +118,20 @@ def reconstruct_scene(rgb_frames, depth_frames, intrinsic_matrix, poses, categor
     )
 
     # 4. Create Open3D intrinsic object
-    h, w = depth_frames[0].shape
+    h0, w0 = depth_frames[0].shape
+    scale = 1.0
+    intrinsic_matrix = intrinsic_matrix.copy()
+    if max(h0, w0) > max_image_dim:
+        scale = max_image_dim / float(max(h0, w0))
+    h = int(round(h0 * scale))
+    w = int(round(w0 * scale))
+
+    if scale != 1.0:
+        intrinsic_matrix[0, 0] *= scale  # fx
+        intrinsic_matrix[1, 1] *= scale  # fy
+        intrinsic_matrix[0, 2] *= scale  # cx
+        intrinsic_matrix[1, 2] *= scale  # cy
+
     intrinsic = o3d.camera.PinholeCameraIntrinsic(
         w, h,
         intrinsic_matrix[0, 0], intrinsic_matrix[1, 1],
@@ -109,8 +140,15 @@ def reconstruct_scene(rgb_frames, depth_frames, intrinsic_matrix, poses, categor
 
     # 5. Integrate frames
     for i in range(len(rgb_frames)):
-        rgb = o3d.geometry.Image(rgb_frames[i])
-        depth = o3d.geometry.Image(depth_frames[i])
+        rgb_np = rgb_frames[i]
+        depth_np = depth_frames[i]
+
+        if scale != 1.0:
+            rgb_np = cv2.resize(rgb_np, (w, h), interpolation=cv2.INTER_AREA)
+            depth_np = cv2.resize(depth_np, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        rgb = o3d.geometry.Image(rgb_np)
+        depth = o3d.geometry.Image(depth_np)
 
         # Note: depth_scale=1000.0 because depth is in mm
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
@@ -120,7 +158,13 @@ def reconstruct_scene(rgb_frames, depth_frames, intrinsic_matrix, poses, categor
             convert_rgb_to_intensity=False
         )
 
-        volume.integrate(rgbd, intrinsic, extrinsics[i])
+        try:
+            volume.integrate(rgbd, intrinsic, extrinsics[i])
+        except MemoryError as e:
+            raise MemoryError(
+                f"TSDF integrate failed at frame {i} "
+                f"(frames={len(rgb_frames)}, size={w}x{h}, voxel={voxel_length})."
+            ) from e
 
     # 6. Extraction
     pcd = volume.extract_point_cloud()

@@ -66,6 +66,11 @@ def measure_duct(points):
     if len(points) == 0:
         return {"diameter_m": 0.0, "length_m": 0.0}
 
+    # Keep duct measurement bounded for very dense ROI clouds.
+    if len(points) > 300000:
+        idx = np.random.choice(len(points), 300000, replace=False)
+        points = points[idx]
+
     # Estimate cylinder axis
     axis = estimate_axis_pca(points)
     projections = points @ axis
@@ -176,6 +181,13 @@ def measure_asset(pcd, category_tag):
             res["detected"] = False
             res["confidence"] = "low"
             res["message"] = f"{cat} not detected"
+            # Near-miss safeguard: for substantial ROIs with borderline scores,
+            # return best-effort dimensions instead of all-N/A.
+            if point_count >= 3000 and score >= 2.0:
+                m = handler(roi_pcd, points)
+                res.update(m)
+                res["measurement_mode"] = "best_effort"
+                res["message"] = f"{cat} not confidently detected; best-effort estimate"
             return res
 
         m = handler(roi_pcd, points)

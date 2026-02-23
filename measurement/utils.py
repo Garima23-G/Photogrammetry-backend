@@ -41,14 +41,27 @@ def fit_circle_ransac(points, iterations=200, threshold=0.01):
 
     return best_circle
 
-def estimate_axis_pca(points):
-    """Estimates the principal axis of a 3D point cloud using PCA."""
+def estimate_axis_pca(points, max_points=200000):
+    """Estimates the principal axis of a 3D point cloud using memory-safe PCA."""
+    points = np.asarray(points)
     if len(points) < 3:
-        return np.array([0, 0, 1], dtype=np.float64)
+        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
-    mean = np.mean(points, axis=0)
-    centered = points - mean
-    # We use SVD for robustness
-    _, _, vh = np.linalg.svd(centered)
-    # The first row of V^H (first column of V) is the principal component
-    return vh[0]
+    # Bound memory/CPU for very dense clouds.
+    if len(points) > max_points:
+        idx = np.random.choice(len(points), max_points, replace=False)
+        points = points[idx]
+
+    pts = np.asarray(points, dtype=np.float64)
+    mean = np.mean(pts, axis=0)
+    centered = pts - mean
+
+    # 3x3 covariance eigendecomposition is much lighter than full SVD on Nx3.
+    cov = (centered.T @ centered) / max(1, len(centered) - 1)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    axis = eigvecs[:, int(np.argmax(eigvals))]
+
+    norm = np.linalg.norm(axis)
+    if not np.isfinite(norm) or norm < 1e-9:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    return axis / norm

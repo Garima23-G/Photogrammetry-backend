@@ -17,6 +17,43 @@ app = Flask(__name__)
 # If depth pixel is in [0,255], we map back to millimeters in [0, 8000].
 FALLBACK_DEPTH_MM_MAX = 8000
 
+
+def _log_request_overview(endpoint):
+    form_keys = sorted(list(request.form.keys()))
+    file_keys = sorted(list(request.files.keys()))
+    rgb_keys = sorted([k for k in file_keys if k.startswith("rgb_")])
+    depth_keys = sorted([k for k in file_keys if k.startswith("depth_")])
+    app.logger.info(
+        "[%s] content_type=%s form_keys=%s file_keys=%s rgb_count=%d depth_count=%d",
+        endpoint,
+        request.content_type,
+        form_keys,
+        file_keys,
+        len(rgb_keys),
+        len(depth_keys),
+    )
+
+
+def _log_bad_request(endpoint, err):
+    intrinsics_present = bool(request.form.get("intrinsics"))
+    poses_raw = request.form.get("poses")
+    poses_present = bool(poses_raw)
+    poses_count_hint = None
+    if poses_raw:
+        try:
+            poses_count_hint = len(json.loads(poses_raw))
+        except Exception:
+            poses_count_hint = "parse_error"
+
+    app.logger.warning(
+        "[%s] bad_request error=%s intrinsics_present=%s poses_present=%s poses_count_hint=%s",
+        endpoint,
+        str(err),
+        intrinsics_present,
+        poses_present,
+        poses_count_hint,
+    )
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify(
@@ -253,6 +290,7 @@ def classify_asset():
     - Hybrid RGB+3D: send rgb_i + depth_i + intrinsics + poses
     """
     try:
+        _log_request_overview("classify")
         has_metadata = bool(request.form.get("intrinsics") and request.form.get("poses"))
         if has_metadata:
             intrinsic_matrix, poses = _parse_intrinsics_and_poses()
@@ -291,8 +329,18 @@ def classify_asset():
             }
         )
     except ValueError as e:
+        _log_bad_request("classify", e)
         return jsonify({"error": str(e)}), 400
+    except MemoryError as e:
+        app.logger.exception("[classify] memory error")
+        return jsonify(
+            {
+                "error": "Server out of memory during reconstruction/classification.",
+                "details": str(e),
+            }
+        ), 507
     except Exception as e:
+        app.logger.exception("[classify] unhandled error")
         return jsonify({"error": str(e)}), 500
 
 
@@ -302,6 +350,7 @@ def reconstruct_only():
     Reconstruction-only endpoint for Stage 04.
     """
     try:
+        _log_request_overview("reconstruct")
         intrinsic_matrix, poses = _parse_intrinsics_and_poses()
         rgb_frames, depth_frames = _parse_rgbd_frames_from_poses(poses)
         category = normalize_category_name(request.form.get("category")) or "unclassified"
@@ -311,8 +360,18 @@ def reconstruct_only():
         )
         return jsonify(_build_reconstruction_summary(reconstruction_result))
     except ValueError as e:
+        _log_bad_request("reconstruct", e)
         return jsonify({"error": str(e)}), 400
+    except MemoryError as e:
+        app.logger.exception("[reconstruct] memory error")
+        return jsonify(
+            {
+                "error": "Server out of memory during reconstruction.",
+                "details": str(e),
+            }
+        ), 507
     except Exception as e:
+        app.logger.exception("[reconstruct] unhandled error")
         return jsonify({"error": str(e)}), 500
 
 
@@ -328,34 +387,56 @@ def process_reconstruction():
     - category: optional asset category tag
     """
     try:
+        _log_request_overview("process")
         intrinsic_matrix, poses = _parse_intrinsics_and_poses()
         rgb_frames, depth_frames = _parse_rgbd_frames_from_poses(poses)
-        category = normalize_category_name(request.form.get("category"))
-
-        category_for_recon = category if category else "unclassified"
+        requested_category = normalize_category_name(request.form.get("category"))
+        category_for_recon = requested_category if requested_category else "unclassified"
         reconstruction_result = reconstruct_scene(
             rgb_frames, depth_frames, intrinsic_matrix, poses, category_for_recon
         )
 
+        # Always compute predicted category so UI can surface mismatch warnings.
+        predicted_category, predicted_confidence, fused_scores, _ = detect_asset_category_hybrid(
+            rgb_frames, reconstruction_result["pcd"]
+        )
+        predicted_score = float(fused_scores.get(predicted_category, 0.0))
+
         category_source = "request"
-        category_confidence = None
-        category_score = None
+        category = requested_category
         if not category:
-            category, category_confidence, fused_scores, _ = detect_asset_category_hybrid(
-                rgb_frames, reconstruction_result["pcd"]
-            )
-            category_score = float(fused_scores.get(category, 0.0))
+            category = predicted_category
             category_source = "auto_hybrid"
 
         measurement_result = measure_asset(reconstruction_result["pcd"], category)
         measurement_result["category_source"] = category_source
-        if category_confidence is not None:
-            measurement_result["category_confidence"] = category_confidence
-            measurement_result["category_score"] = category_score
+        measurement_result["measurement_confidence"] = measurement_result.get("confidence")
+        measurement_result["predicted_category"] = predicted_category
+        measurement_result["predicted_category_confidence"] = predicted_confidence
+        measurement_result["predicted_category_score"] = predicted_score
+        measurement_result["category_mismatch"] = bool(
+            requested_category and predicted_category != requested_category
+        )
+        if measurement_result["category_mismatch"]:
+            measurement_result["category_mismatch_message"] = (
+                f"Requested '{requested_category}', but model predicts '{predicted_category}'."
+            )
+        else:
+            measurement_result["category_mismatch_message"] = ""
         return jsonify(measurement_result)
     except ValueError as e:
+        _log_bad_request("process", e)
         return jsonify({"error": str(e)}), 400
+    except MemoryError as e:
+        app.logger.exception("[process] memory error")
+        return jsonify(
+            {
+                "error": "Server out of memory during end-to-end processing.",
+                "details": str(e),
+            }
+        ), 507
     except Exception as e:
+        app.logger.exception("[process] unhandled error")
         return jsonify({"error": str(e)}), 500
 
 
@@ -365,12 +446,15 @@ def pose_sanity():
     Validate capture metadata only (intrinsics + poses), without processing images.
     """
     try:
+        _log_request_overview("pose_sanity")
         intrinsic_matrix, poses = _parse_intrinsics_and_poses()
         analysis = _analyze_intrinsics_and_poses(intrinsic_matrix, poses)
         return jsonify(analysis)
     except ValueError as e:
+        _log_bad_request("pose_sanity", e)
         return jsonify({"error": str(e)}), 400
     except Exception as e:
+        app.logger.exception("[pose_sanity] unhandled error")
         return jsonify({"error": str(e)}), 500
 
 
